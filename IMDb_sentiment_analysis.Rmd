@@ -1,0 +1,284 @@
+---
+title: "Bayesian learning assignment #1: IMDb reviews sentiment analysis. "
+author: "Juan Luis Jurado"
+date: 'UC3M, 2023/24'
+output:
+  html_document: 
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: no
+    toc: no
+    toc_depth: 1
+  pdf_document:
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 1
+editor_options:
+  chunk_output_type: console
+---
+    
+```{r global_options, include=T, echo = F}
+knitr::opts_chunk$set(echo = T, warning=FALSE, message=FALSE)
+```
+
+```{r, echo=FALSE}
+htmltools::img(src = knitr::image_uri(file.path("uc3m.jpg")), 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:0; padding:10px;')
+
+library(tm)
+library(wordcloud)
+library(e1071)
+library(caret)
+```
+
+# Introduction
+
+In this document I will carry out a sentiment analysis to try and build a naive bayesian classifier capable of predicting whether a given movie review is overall positive or negative in nature. To this end, I will analyze a dataset of 10000 reviews taken from IMDb, available at Kaggle: [Small IMDb reviews dataset](https://www.kaggle.com/datasets/volodymyrgavrysh/imdb-sentiment-10k-reviews-binary-classification?resource=download).
+
+The dataset only contains two columns: 
+
+- Review (character): Character string of the whole IMDb review.
+- Sentiment (binary): Sentiment of the review. Positive (0) or Negative (1).
+
+First of all, in order to improve interpretability, I will replace the 0/1 encoding of the target variable to Positive/Negative.
+
+```{r}
+data = read.csv("imdb_10K_sentimnets_reviews.csv")
+
+pos = data$sentiment == 0
+data$sentiment[pos] = "Positive"
+data$sentiment[!pos] = "Negative"
+
+table(data$sentiment)
+```
+
+The table above shows that both classes are quite balanced in our dataset.
+
+# Data cleaning
+
+In this next section I will prepare the data for the coming analysis. To do this, I am going to go through the following pipeline.
+
+1. **Set all text to lowercase.** This will allow us to better identify different instances of the same word
+2. **Remove numbers and punctuation**. Although this may occasionally be an indicator of sentiment (e.g a numeric rating or several ?!?! symbols), it could add more noise than information to our data due to the different use cases.
+3. **Remove special characters**. As stated above, we are assuming that these do not contribute in a significant way to the sentiment information of the message.
+4. **Remove stopwords**. These add no relevant information in terms of sentiment of the review.
+5. **Delete extra spaces**. This process will help better identify the different terms.
+
+```{r}
+## Transform the reviews column into a corpus
+reviews = Corpus(VectorSource(data$review))
+
+## Set to lowercase
+clean_reviews = tm_map(reviews, tolower)
+
+## Remove numbers and punctuation
+clean_reviews = tm_map(
+        tm_map(clean_reviews, removeNumbers), 
+        removePunctuation)
+
+## Remove special characters
+removeSpecial = function(doc){
+        specialChars = "[@&%$#~/\\()=*º><{}]"
+        clean_doc = gsub(specialChars, "", doc)
+        return(clean_doc)
+}
+
+clean_reviews = tm_map(clean_reviews, removeSpecial)
+
+## Remove stopwords
+clean_reviews = tm_map(clean_reviews, removeWords, stopwords("en"))
+
+## Delete extra spaces
+clean_reviews = tm_map(clean_reviews, stripWhitespace)
+```
+
+After this cleaning, we have extracted the list of words that appear in each of the reviews.
+
+Next, in order to get a feeling of the accuracy we can expect from the classifier, I will compare the most repeated terms across all reviews grouping by sentiment. If these words are significantly different for negative and positive reviews, we should be able to train a good classifier.
+
+To this end, I have generated wordclouds of the most used words for each category, so that we may compare them.
+
+```{r}
+## Positive wordcloud
+wordcloud(clean_reviews[pos], min.freq=1000, scale=c(3,.5))
+
+## Negative wordcloud
+wordcloud(clean_reviews[!pos], min.freq=1000, scale=c(3,.5))
+```
+
+We can see that the most repeated words for positive and negative reviews are very similar, and thus we can expect the classifier to make a sizable error.
+
+# Training the model
+
+Let us now move towards building our classifier. Before carrying on with the analysis it is advisable to split the data into train, validation and test sets so that we are able to estimate the future performance of the model. After the split, we create a matrix with one row per instance and one column per word, where each entry is the number of times a given word appears in each review for the training set.
+
+```{r}
+## Train/test split
+tr_idx = createDataPartition(data$sentiment, p=c(0.6), list = FALSE)
+
+train = data[tr_idx, ]
+dummy = data[-tr_idx, ]
+
+## Train/evaluation/test split
+ev_idx = createDataPartition(dummy$sentiment, p=c(0.5), list = FALSE)
+
+eval = dummy[ev_idx, ]
+test = dummy[-ev_idx, ]
+
+reviews_train = clean_reviews[tr_idx]
+reviews_eval = clean_reviews[-tr_idx][ev_idx]
+reviews_test = clean_reviews[-tr_idx][-ev_idx]
+
+## Document term matrix
+reviews_dtm_train = DocumentTermMatrix(reviews_train)
+```
+
+To simplify computations and decrease noise, I will remove all words that appear less times than a certain threshold $n$ in the mentioned matrix. Once the matrix includes only the relevant words, it will be transformed into a binary matrix showcasing only whether a certain appears (1) or not (0) in a given instance.
+
+```{r}
+## Binary transformation
+binary_mtrx = function(freq){
+        return(ifelse(freq > 0, 1,0))
+}
+
+## Function for HPT
+nwords_tuning = function(n){
+        
+        relevant_words = findFreqTerms(reviews_dtm_train, n) 
+        
+        dtm_train = DocumentTermMatrix(
+                reviews_train, 
+                control = list(dictionary = relevant_words)
+                )
+        dtm_eval = DocumentTermMatrix(
+                reviews_eval, 
+                control = list(dictionary = relevant_words)
+                )
+        
+        bin_dtm_train = apply(dtm_train, 2,
+                                  binary_mtrx)
+        bin_dtm_eval = apply(dtm_eval, 2,
+                                binary_mtrx)
+        
+        return(list(
+                bin_dtm_train, 
+                bin_dtm_eval, 
+                length(relevant_words)
+                ))
+}
+```
+
+The determination of the threshold $n$ will be carried out by a holdout validation using grid search. This is, I will train several models with varying values of $n$ and keep the value of n with the highest accuracy. Since the problem is moreless symmetric, I will not introduce any additional weights for the calculation of the accuracy measure, and thus it will be computed as the number of correct predictions over all predictions
+
+```{r}
+nwords = c(25, 50, 75, 100, 125, 150, 175, 200)
+acc = vector("numeric", length(nwords))
+
+for (i in seq_along(nwords)){
+        
+        ## Get binary matrices
+        res = nwords_tuning(nwords[i])
+        bin_dtm_train = res[[1]]
+        bin_dtm_eval = res[[2]]
+        
+        ## Build classifier
+        classifier = naiveBayes(bin_dtm_train,
+                                train$sentiment)
+        
+        ## Assess performance
+        predictions = predict(classifier,
+                             newdata = bin_dtm_eval)
+        CM = table(predictions, eval$sentiment)
+        acc[i] = (CM[1] + CM[4]) / (nrow(eval))
+}
+
+## Plot results
+HPT = data.frame(N_words = nwords, Accuracy = acc)
+ggplot(HPT, aes(N_words, Accuracy)) +
+        geom_line(color = "steelblue") +
+        labs(title="HPT for appearence threshold (n)", x="Minimum number of word appearences", y="Accuracy") +
+        theme(plot.title = element_text(hjust = 0.5, size = rel(1.4)))
+
+optimal_n = nwords[which.max(acc)]
+cat("The optimal value of n is ", optimal_n)
+```
+
+# Results
+
+After having determined the optimal hyperparameter $n$, we will now evaluate the model with the training set. To do this, we merge the training and evaluation sets into the new training set, and get the document-term matrix of this new partition.
+
+```{r}
+## Merge train/evaluation sets
+train = rbind(train, eval)
+
+allnums = 1:length(reviews_train)
+dm_idx = allnums[!(allnums %in% tr_idx)]
+Tev_idx = dm_idx[ev_idx]
+
+reviews_train = clean_reviews[c(tr_idx, Tev_idx)]
+
+## Document term matrix
+reviews_dtm_train = DocumentTermMatrix(reviews_train)
+```
+
+Using the optimal parameter found in the last section, we get rid of the irrelevant words and construct the binary matrix once again.
+
+```{r}
+relevant_words = findFreqTerms(reviews_dtm_train, optimal_n)
+        
+dtm_train = DocumentTermMatrix(
+        reviews_train, 
+        control = list(dictionary = relevant_words)
+        )
+dtm_test = DocumentTermMatrix(
+        reviews_test, 
+        control = list(dictionary = relevant_words)
+        )
+        
+bin_dtm_train = apply(dtm_train, 2, binary_mtrx)
+bin_dtm_test = apply(dtm_test, 2, binary_mtrx)
+```
+
+Finally, we train the classifier with the test set and check its accuracy.
+
+```{r}
+classifier = naiveBayes(bin_dtm_train, train$sentiment)
+predictions = predict(classifier, newdata = bin_dtm_test)
+CM = table(predictions, test$sentiment)
+print(CM)
+
+accuracy = (CM[1] + CM[4]) / (nrow(eval))
+print(accuracy)
+```
+
+As expected from the wordclouds, the naive Bayes classifiers has quite some error when classifying reviews into positive or negative. However, the accuracy we obtain is much greater than that of the dummy benchmark (majority class acc ~ 0.5). Thus, we can say that our classifier is a good enough model although it does not solve the problem completely.
+
+To close this section, we will introduce Laplace smoothing into the classifier, and study the impact it has in its performance.
+
+```{r}
+Laplace_class = naiveBayes(bin_dtm_train, train$sentiment, laplace = 2)
+Laplace_preds = predict(Laplace_class, newdata = bin_dtm_test)
+CM = table(Laplace_preds, test$sentiment)
+print(CM)
+
+accuracy = (CM[1] + CM[4]) / (nrow(eval))
+print(accuracy)
+```
+
+We can see that, for this particular example, the Laplace smoothing has no effect on the performance of the model. This result may look surprising until we consider the combined action of two factors.
+
+In the first place, both classes are extremely balanced. This means that the overall number of words appearing in each of the classes will be moreless the same.
+
+In second place, the process of hyperparameter tuning yielded that all words appearing less than 100 times must be discarded for optimal performance.
+
+Therefore, with a sample as large as ours, it may very well be that every word considered has representation in both groups, which prevents extreme (0 or 1) conditional probabilities. For this reason, the effect of Laplace smoothing can go unnoticed.
+
+# Conclusions
+
+As mentioned above, the model successfully classifies instances around 80% of the time, which is much better than the benchmark (~50%) but not perfect.
+Some possible improvements to boost prediction accuracy include considering a wider range of hyperparameters, working with a larger dataset, or ultimately using machine learning methods instead of statistical ones.
